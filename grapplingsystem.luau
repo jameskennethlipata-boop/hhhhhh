@@ -1,72 +1,59 @@
 -- made by @zavenx
--- grappling hook with rope physics
--- uses modern roblox constraint system with linearvelocity and alignorientation
+-- grappling hook with rope physics using modern constraint system
 
--- services section
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 
--- tuning settings section
--- these control how the grapple feels during gameplay
-local MAX_GRAPPLE_DIST = 300 -- max distance you can shoot the hook
-local MIN_DIST = 10 -- prevents grappling too close to yourself
-local REEL_SPEED = 10 -- how fast space bar pulls you in
-local GRAVITY = 196.2 -- studs/s² gravity acceleration (roblox default)
-local ROPE_SPRING = 1400 -- spring constant for rope tension, higher = tighter rope that resists stretching
-local AIR_RESISTANCE = 0.994 -- multiplier per frame, simulates air drag to prevent infinite acceleration
-local MAX_VELOCITY = 220 -- velocity cap to prevent physics from breaking at extreme speeds
-local PLAYER_CONTROL = 75 -- base force applied when pressing wasd mid-swing
-local SWING_MULTIPLIER = 2.8 -- bonus multiplier when moving with the swing direction instead of against it
-local BOOST_ON_ATTACH = 1.08 -- multiplies your current velocity when hook connects to give initial momentum
+-- tuning constants - exposed here so I can tweak feel without digging through code
+local MAX_GRAPPLE_DIST = 300
+local MIN_DIST = 10
+local REEL_SPEED = 10
+local GRAVITY = 196.2
+local ROPE_SPRING = 1400 -- went with spring-based rope over rigid constraint because slight stretch feels more natural
+local AIR_RESISTANCE = 0.994 -- prevents infinite acceleration on repeated swings
+local MAX_VELOCITY = 220 -- roblox physics breaks above ~250 studs/s
+local PLAYER_CONTROL = 75 -- balance between responsive and physics-driven
+local SWING_MULTIPLIER = 2.8 -- rewards building momentum in one direction
+local BOOST_ON_ATTACH = 1.08 -- preserves running speed when you grapple, feels way better than zeroing velocity
 
--- visual settings section
 local ROPE_THICKNESS = 0.22
 local ROPE_COL = Color3.fromRGB(200, 220, 240)
 local INDICATOR_COL = Color3.fromRGB(100, 255, 150)
 local INDICATOR_SIZE = 1.2
 
--- main class section
 local GrappleHook = {}
 GrappleHook.__index = GrappleHook
 
--- creates new grapple hook instance for a character
--- sets up all the physics objects and input tracking we need
+-- using OOP because each player needs independent grapple state, makes respawns cleaner
 function GrappleHook.new(char)
 	local hook = setmetatable({}, GrappleHook)
-	
+
 	hook.character = char
 	hook.humanoid = char:WaitForChild("Humanoid")
 	hook.hrp = char:WaitForChild("HumanoidRootPart")
-	
 	hook.isGrappling = false
 	hook.grapplePoint = nil
-	hook.currentRopeLength = 0
+	hook.currentRopeLength = 0 -- smoothly interpolates toward desired length instead of instant changes
 	hook.desiredRopeLength = 0
-	hook.vel = Vector3.new() -- tracks velocity manually because we override default physics
-	
-	-- modern physics constraints that replace deprecated bodyvelocity/bodygyro
-	hook.linearVel = nil
-	hook.alignOrientation = nil
-	hook.attachment = nil -- needed for the new constraint system
-	
+	hook.vel = Vector3.new() -- tracking velocity manually because we need to apply custom forces, can't just read AssemblyLinearVelocity
+	hook.linearVel = nil -- modern replacement for deprecated BodyVelocity, better replication
+	hook.alignOrientation = nil -- keeps character upright during swings
+	hook.attachment = nil
 	hook.ropePart = nil
 	hook.targetIndicator = nil
 	hook.targetPos = nil
-	
-	-- manual input tracking because humanoid.MoveDirection doesn't work well with platformstand
-	hook.keysDown = {w = false, a = false, s = false, d = false}
+	hook.keysDown = {w = false, a = false, s = false, d = false} -- manual tracking because Humanoid.MoveDirection doesn't work in PlatformStand
 	hook.isReeling = false
-	
 	hook.connections = {}
-	
+
 	hook:makeIndicator()
 	hook:bindInputs()
-	
+
 	return hook
 end
 
--- creates the visual indicator that shows where your hook will attach
+-- visual indicator so players can see where they're aiming before shooting
 function GrappleHook:makeIndicator()
 	local ind = Instance.new("Part")
 	ind.Name = "TargetIndicator"
@@ -78,43 +65,35 @@ function GrappleHook:makeIndicator()
 	ind.Anchored = true
 	ind.CanCollide = false
 	ind.Parent = workspace
-	
 	self.targetIndicator = ind
 end
 
--- updates indicator position and visibility based on mouse raycast
--- only shows indicator when aiming at valid grapple point
+-- raycasts from camera through mouse to find valid grapple points
 function GrappleHook:updateIndicator()
 	if self.isGrappling then
 		self.targetIndicator.Transparency = 1
 		return
 	end
-	
+
 	local mouse = Players.LocalPlayer:GetMouse()
 	local camera = workspace.CurrentCamera
-	
-	-- raycast from camera through mouse position
 	local screenRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
 	local rayOrigin = screenRay.Origin
 	local rayDir = screenRay.Direction * MAX_GRAPPLE_DIST
-	
+
 	local params = RaycastParams.new()
 	params.FilterDescendantsInstances = {self.character, self.targetIndicator}
 	params.FilterType = Enum.RaycastFilterType.Exclude
-	
+
 	local hit = workspace:Raycast(rayOrigin, rayDir, params)
-	
+
 	if hit then
 		local distance = (hit.Position - self.hrp.Position).Magnitude
-		
-		-- only show indicator if hit is within valid range
 		if distance >= MIN_DIST and distance <= MAX_GRAPPLE_DIST then
 			self.targetPos = hit.Position
 			self.targetIndicator.Position = hit.Position
 			self.targetIndicator.Transparency = 0.3
-			
-			-- adds a pulsing effect so it's easier to see
-			local pulseAmount = 0.85 + math.sin(tick() * 8) * 0.15
+			local pulseAmount = 0.85 + math.sin(tick() * 8) * 0.15 -- pulsing makes target more visible
 			self.targetIndicator.Size = Vector3.new(INDICATOR_SIZE, INDICATOR_SIZE, INDICATOR_SIZE) * pulseAmount
 		else
 			self.targetIndicator.Transparency = 1
@@ -126,14 +105,12 @@ function GrappleHook:updateIndicator()
 	end
 end
 
--- binds all input controls for grappling and movement
--- tracks key states manually so we can read them during physics updates
+-- tracks input states manually for reliable simultaneous key detection
 function GrappleHook:bindInputs()
 	local conn1 = UIS.InputBegan:Connect(function(input, gpe)
 		if gpe then return end
-		
+
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			-- left click toggles grapple on/off
 			if self.isGrappling then
 				self:detachGrapple()
 			else
@@ -151,7 +128,7 @@ function GrappleHook:bindInputs()
 			self.isReeling = true
 		end
 	end)
-	
+
 	local conn2 = UIS.InputEnded:Connect(function(input)
 		if input.KeyCode == Enum.KeyCode.W then
 			self.keysDown.w = false
@@ -165,62 +142,53 @@ function GrappleHook:bindInputs()
 			self.isReeling = false
 		end
 	end)
-	
+
 	table.insert(self.connections, conn1)
 	table.insert(self.connections, conn2)
 end
 
--- shoots the grapple hook to current target position
--- initializes rope physics and takes over character movement
+-- initiates grapple and transitions to custom physics mode
 function GrappleHook:fireGrapple()
 	if self.isGrappling or not self.targetPos then return end
-	
+
 	local dist = (self.targetPos - self.hrp.Position).Magnitude
 	if dist < MIN_DIST or dist > MAX_GRAPPLE_DIST then return end
-	
+
 	self.isGrappling = true
 	self.grapplePoint = self.targetPos
 	self.currentRopeLength = dist
 	self.desiredRopeLength = dist
-	
-	-- preserve current velocity and boost it slightly for better feel
-	self.vel = self.hrp.AssemblyLinearVelocity * BOOST_ON_ATTACH
-	
+	self.vel = self.hrp.AssemblyLinearVelocity * BOOST_ON_ATTACH -- preserves momentum instead of killing your speed
+
 	self:startPhysics()
 	self:makeRope()
 end
 
--- releases the grapple and returns control to normal character physics
+-- releases grapple and returns to normal humanoid physics
 function GrappleHook:detachGrapple()
 	if not self.isGrappling then return end
-	
+
 	self.isGrappling = false
 	self.grapplePoint = nil
 	self.isReeling = false
-	
+
 	self:stopPhysics()
 	self:destroyRope()
 end
 
--- enables custom physics mode using modern constraint system
--- we need linearvelocity to control movement and alignorientation to keep player upright
+-- enables custom physics using modern constraints, overrides humanoid movement
 function GrappleHook:startPhysics()
-	-- create attachment point on hrp for constraints to use
 	self.attachment = Instance.new("Attachment")
 	self.attachment.Parent = self.hrp
-	
-	-- linearvelocity replaces the old deprecated bodyvelocity
-	-- it applies velocity relative to world space through the attachment
-	self.linearVel = Instance.new("LinearVelocity")
+
+	self.linearVel = Instance.new("LinearVelocity") -- modern API requires attachment anchor point
 	self.linearVel.Attachment0 = self.attachment
 	self.linearVel.MaxForce = math.huge
 	self.linearVel.VectorVelocity = self.vel
 	self.linearVel.RelativeTo = Enum.ActuatorRelativeTo.World
 	self.linearVel.Parent = self.hrp
-	
-	-- alignorientation replaces the old deprecated bodygyro
-	-- keeps the character facing forward and upright during swing
-	self.alignOrientation = Instance.new("AlignOrientation")
+
+	self.alignOrientation = Instance.new("AlignOrientation") -- prevents character from tumbling during swings
 	self.alignOrientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
 	self.alignOrientation.Attachment0 = self.attachment
 	self.alignOrientation.MaxTorque = 9e5
@@ -228,156 +196,136 @@ function GrappleHook:startPhysics()
 	self.alignOrientation.CFrame = self.hrp.CFrame
 	self.alignOrientation.RigidityEnabled = false
 	self.alignOrientation.Parent = self.hrp
-	
-	-- physics state prevents normal humanoid movement from interfering
+
 	self.humanoid:ChangeState(Enum.HumanoidStateType.Physics)
-	self.humanoid.PlatformStand = true
+	self.humanoid.PlatformStand = true -- disables default humanoid physics so it doesn't fight our forces
 end
 
--- disables custom physics and returns to normal humanoid control
--- preserves velocity so you keep momentum after releasing hook
+-- restores normal physics and preserves velocity for momentum chaining
 function GrappleHook:stopPhysics()
 	if self.linearVel then
-		-- apply our calculated velocity to the character before destroying constraints
-		self.hrp.AssemblyLinearVelocity = self.vel
+		self.hrp.AssemblyLinearVelocity = self.vel -- apply velocity before destroying constraint
 		self.linearVel:Destroy()
 		self.linearVel = nil
 	end
-	
+
 	if self.alignOrientation then
 		self.alignOrientation:Destroy()
 		self.alignOrientation = nil
 	end
-	
+
 	if self.attachment then
 		self.attachment:Destroy()
 		self.attachment = nil
 	end
-	
+
 	self.humanoid.PlatformStand = false
 	self.humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
 end
 
--- converts wasd input to world space direction vector based on camera orientation
--- this lets you swing in the direction you're looking instead of relative to character
+-- converts wasd to camera-relative direction, flattened to horizontal plane
 function GrappleHook:getInputDirection()
 	local cam = workspace.CurrentCamera
 	local camForward = cam.CFrame.LookVector
 	local camRight = cam.CFrame.RightVector
-	
-	-- flatten vectors to horizontal plane so input doesn't affect vertical movement
-	camForward = Vector3.new(camForward.X, 0, camForward.Z).Unit
-	camRight = Vector3.new(camRight.X, 0, camRight.Z).Unit
-	
+
+	-- flatten to horizontal plane
+	local flatForward = Vector3.new(camForward.X, 0, camForward.Z)
+	local flatRight = Vector3.new(camRight.X, 0, camRight.Z)
+
+	-- safe normalization - if looking straight up/down, use fallback direction
+	if flatForward.Magnitude < 0.01 then
+		flatForward = Vector3.new(0, 0, -1) -- default to negative Z when camera is vertical
+	else
+		flatForward = flatForward.Unit
+	end
+
+	if flatRight.Magnitude < 0.01 then
+		flatRight = Vector3.new(1, 0, 0) -- default to positive X
+	else
+		flatRight = flatRight.Unit
+	end
+
 	local moveVec = Vector3.new()
-	
-	if self.keysDown.w then moveVec = moveVec + camForward end
-	if self.keysDown.s then moveVec = moveVec - camForward end
-	if self.keysDown.a then moveVec = moveVec - camRight end
-	if self.keysDown.d then moveVec = moveVec + camRight end
-	
+	if self.keysDown.w then moveVec = moveVec + flatForward end
+	if self.keysDown.s then moveVec = moveVec - flatForward end
+	if self.keysDown.a then moveVec = moveVec - flatRight end
+	if self.keysDown.d then moveVec = moveVec + flatRight end
+
 	if moveVec.Magnitude > 0 then
 		return moveVec.Unit
 	end
-	
 	return Vector3.new()
 end
 
--- main physics update that runs every frame while grappling
--- handles gravity, rope constraint, swinging mechanics, and player control
+-- main physics loop, runs every frame while grappling. doing custom physics instead of RopeConstraint because I need precise control over feel
 function GrappleHook:physicsStep(dt)
 	if not self.isGrappling or not self.grapplePoint then return end
-	
+
 	local pos = self.hrp.Position
 	local toGrapple = self.grapplePoint - pos
 	local ropeDir = toGrapple.Unit
 	local dist = toGrapple.Magnitude
-	
-	-- reeling mechanic shortens rope when holding space
+
 	if self.isReeling then
 		self.desiredRopeLength = math.max(self.desiredRopeLength - REEL_SPEED, 3)
 	end
-	
-	-- smooth interpolation to desired length instead of instant change
-	self.currentRopeLength = self.currentRopeLength + (self.desiredRopeLength - self.currentRopeLength) * 0.15
-	
-	-- apply gravity acceleration
-	self.vel = self.vel + Vector3.new(0, -GRAVITY, 0) * dt
-	
-	-- rope constraint section
-	-- if player is farther than rope length, pull them back with spring force
+
+	self.currentRopeLength = self.currentRopeLength + (self.desiredRopeLength - self.currentRopeLength) * 0.15 -- smooth interpolation
+
+	self.vel = self.vel + Vector3.new(0, -GRAVITY, 0) * dt -- gravity
+
 	if dist > self.currentRopeLength then
 		local stretch = dist - self.currentRopeLength
-		
-		-- hooke's law: F = kx where k is spring constant and x is displacement
-		local springForce = ropeDir * stretch * ROPE_SPRING
+		local springForce = ropeDir * stretch * ROPE_SPRING -- hooke's law F=kx
 		self.vel = self.vel + springForce * dt
-		
-		-- if velocity is pulling away from anchor point, cancel it out
-		-- this prevents the rope from stretching infinitely
+
 		local velocityToward = self.vel:Dot(ropeDir)
 		if velocityToward < 0 then
-			self.vel = self.vel - ropeDir * velocityToward * 1.2
+			self.vel = self.vel - ropeDir * velocityToward * 1.2 -- cancel outward velocity to prevent infinite stretch
 		end
-		
-		-- centripetal acceleration for circular motion
-		-- decompose velocity into radial (toward anchor) and tangential (perpendicular)
-		local perpVel = self.vel - (self.vel:Dot(ropeDir) * ropeDir)
-		-- F = mv²/r but we're calculating acceleration so it's just v²/r
-		local centripetal = perpVel.Magnitude * perpVel.Magnitude / self.currentRopeLength
-		-- apply force toward anchor to maintain arc trajectory
+
+		local perpVel = self.vel - (self.vel:Dot(ropeDir) * ropeDir) -- tangential velocity component
+		local centripetal = perpVel.Magnitude * perpVel.Magnitude / self.currentRopeLength -- v²/r for circular motion
 		self.vel = self.vel + ropeDir * centripetal * dt
 	end
-	
-	-- player control section
-	-- lets you influence swing direction with wasd
+
 	local inputDir = self:getInputDirection()
 	if inputDir.Magnitude > 0 then
-		-- separate velocity into radial and tangential components
 		local radial = self.vel:Dot(ropeDir) * ropeDir
 		local tangent = self.vel - radial
-		
 		local controlForce = inputDir * PLAYER_CONTROL
-		
-		-- boost control force when moving with the swing instead of against it
-		-- makes it easier to build momentum in the natural swing direction
+
 		if tangent.Magnitude > 5 then
 			local swingDir = tangent.Unit
 			local matchAmount = math.abs(inputDir:Dot(swingDir))
-			controlForce = controlForce * (1 + matchAmount * SWING_MULTIPLIER)
+			controlForce = controlForce * (1 + matchAmount * SWING_MULTIPLIER) -- bonus when moving with the swing
 		end
-		
+
 		self.vel = self.vel + controlForce * dt
 	end
-	
-	-- air resistance section
-	-- applies quadratic drag (proportional to v²) which is more realistic than linear
+
 	local speed = self.vel.Magnitude
 	if speed > 0 then
-		local dragAmount = speed * speed * 0.0003
+		local dragAmount = speed * speed * 0.0003 -- quadratic drag
 		self.vel = self.vel - self.vel.Unit * dragAmount * dt
 	end
-	
-	-- also apply constant drag factor
+
 	self.vel = self.vel * AIR_RESISTANCE
-	
-	-- velocity cap to prevent physics from breaking
+
 	if self.vel.Magnitude > MAX_VELOCITY then
-		self.vel = self.vel.Unit * MAX_VELOCITY
+		self.vel = self.vel.Unit * MAX_VELOCITY -- cap to prevent physics breakage
 	end
-	
-	-- apply calculated velocity to the linearvelocity constraint
+
 	self.linearVel.VectorVelocity = self.vel
-	
-	-- update character rotation to face movement direction
-	-- only uses horizontal velocity so character doesn't tilt up/down
+
 	local flatVel = Vector3.new(self.vel.X, 0, self.vel.Z)
 	if flatVel.Magnitude > 2 then
-		self.alignOrientation.CFrame = CFrame.lookAt(pos, pos + flatVel)
+		self.alignOrientation.CFrame = CFrame.lookAt(pos, pos + flatVel) -- face movement direction
 	end
 end
 
--- creates the visual rope part that connects player to grapple point
+-- creates visual rope part
 function GrappleHook:makeRope()
 	local rope = Instance.new("Part")
 	rope.Name = "Rope"
@@ -387,27 +335,21 @@ function GrappleHook:makeRope()
 	rope.CanCollide = false
 	rope.CastShadow = false
 	rope.Parent = workspace
-	
 	self.ropePart = rope
 end
 
--- updates rope visual to stretch between player and grapple point
--- called every frame while grappling
+-- updates rope to stretch between player and grapple point, using Part instead of Beam for performance
 function GrappleHook:updateRope()
 	if not self.isGrappling or not self.ropePart or not self.grapplePoint then return end
-	
-	-- offset start point slightly above character for better visual
-	local startPt = self.hrp.Position + Vector3.new(0, 2, 0)
+
+	local startPt = self.hrp.Position + Vector3.new(0, 2, 0) -- offset so it looks like it's from hand
 	local endPt = self.grapplePoint
 	local length = (endPt - startPt).Magnitude
-	
-	-- position rope at midpoint between start and end, rotated to connect them
 	local ropeCF = CFrame.lookAt(startPt, endPt)
 	self.ropePart.CFrame = ropeCF * CFrame.new(0, 0, -length / 2)
 	self.ropePart.Size = Vector3.new(ROPE_THICKNESS, ROPE_THICKNESS, length)
 end
 
--- destroys rope visual when grapple is released
 function GrappleHook:destroyRope()
 	if self.ropePart then
 		self.ropePart:Destroy()
@@ -415,8 +357,7 @@ function GrappleHook:destroyRope()
 	end
 end
 
--- main update function called every frame
--- routes to appropriate update logic based on grapple state
+-- main update loop
 function GrappleHook:tick(dt)
 	if self.isGrappling then
 		self:physicsStep(dt)
@@ -426,49 +367,43 @@ function GrappleHook:tick(dt)
 	end
 end
 
--- starts the heartbeat loop that drives all updates
 function GrappleHook:init()
 	local tickConn = RunService.Heartbeat:Connect(function(dt)
 		self:tick(dt)
 	end)
-	
 	table.insert(self.connections, tickConn)
 end
 
--- cleanup function to disconnect everything and restore normal state
+-- cleanup to prevent memory leaks on respawn
 function GrappleHook:destroy()
 	for _, conn in ipairs(self.connections) do
 		conn:Disconnect()
 	end
-	
+
 	if self.isGrappling then
 		self:detachGrapple()
 	end
-	
+
 	if self.targetIndicator then
 		self.targetIndicator:Destroy()
 	end
-	
+
 	setmetatable(self, nil)
 end
 
--- initialization section
--- waits for player character and creates grapple hook instance
 local plr = Players.LocalPlayer
 local char = plr.Character or plr.CharacterAdded:Wait()
 local hum = char:WaitForChild("Humanoid")
 
-task.wait(0.2)
+task.wait(0.2) -- small delay to ensure character is fully loaded
 
 local hook = GrappleHook.new(char)
 hook:init()
 
--- cleanup and recreate hook when player dies
 hum.Died:Connect(function()
 	hook:destroy()
 end)
 
--- recreate hook when player respawns
 plr.CharacterAdded:Connect(function(newChar)
 	task.wait(0.2)
 	char = newChar
