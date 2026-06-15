@@ -1,447 +1,493 @@
--- made by @zavenx
--- grappling hook with rope physics using modern constraint system
+-- made by @zavenx | discord: zavenxd | roblox: nevazal
+-- grappling hook with rope physics
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
-local UIS = game:GetService("UserInputService")
+local UserInputService = game:GetService("UserInputService")
 
--- tuning constants - exposed here so I can tweak feel without digging through code
-local MAX_GRAPPLE_DIST = 300
-local MIN_DIST = 10
-local REEL_SPEED = 10
-local GRAVITY = 196.2
-local ROPE_SPRING = 1400 -- went with spring-based rope over rigid constraint because slight stretch feels more natural
-local AIR_RESISTANCE = 0.994 -- prevents infinite acceleration on repeated swings
-local MAX_VELOCITY = 220 -- roblox physics breaks above ~250 studs/s
-local PLAYER_CONTROL = 75
-local SWING_MULTIPLIER = 2.8 -- rewards building momentum in one direction
-local BOOST_ON_ATTACH = 1.08 -- preserves running speed when you grapple, feels way better than zeroing velocity
+-- physics configuration
+-- these values were tuned through testing to feel responsive but not overpowered
+local maxDistance = 300  -- how far you can shoot the hook
+local minDistance = 10   -- prevents attaching to things too close
+local reelSpeed = 10     -- how fast space bar pulls you in
+local gravity = 196.2     -- standard roblox gravity
+local ropeSpring = 1400  -- how strongly the rope pulls when stretched, higher = snappier
+local airDrag = 0.994    -- gradual slowdown per frame to prevent infinite swinging
+local maxSpeed = 220     -- speed cap to prevent physics breaking at extreme velocities
+local controlForce = 75  -- strength of wasd movement while grappling
+local swingBonus = 2.8   -- multiplier when moving with momentum, rewards skillful swinging
+local velocityBoost = 1.08  -- small boost when initially attaching to preserve momentum
+local ropeStretchDamping = 1.2  -- reduces bouncing when rope goes taut
+local ropeLengthLerp = 0.15  -- smooths rope length changes, prevents jarring transitions
+local swingThreshold = 5  -- minimum speed needed before swing bonus kicks in
+local quadraticDrag = 0.0003  -- extra drag at high speeds, prevents going too fast
+local minRotateSpeed = 2  -- character only rotates when moving faster than this
 
-local ROPE_THICKNESS = 0.22
-local ROPE_COL = Color3.fromRGB(200, 220, 240)
-local INDICATOR_COL = Color3.fromRGB(100, 255, 150)
-local INDICATOR_SIZE = 1.2
+-- visual configuration
+local ropeThickness = 0.22
+local ropeColor = Color3.fromRGB(200, 220, 240)
+local indicatorColor = Color3.fromRGB(100, 255, 150)
+local indicatorSize = 1.2
+local pulseSpeed = 8  -- how fast the target indicator pulses
 
+-- edge case thresholds
+-- these prevent division by zero and other math errors with very small numbers
+local minVectorMagnitude = 0.01
+local minRopeLength = 3
+
+-- cached constants to avoid allocations
+-- creating new vector3s every frame is expensive, so we reuse these
+local vectorZero = Vector3.zero
+local vectorOne = Vector3.one
+local ropeOffset = Vector3.new(0, 2, 0)  -- rope attaches slightly above character center
+local gravityVector = Vector3.new(0, -gravity, 0)
+local fallbackForward = Vector3.new(0, 0, -1)  -- used when camera is pointing straight down
+local fallbackRight = Vector3.new(1, 0, 0)
+
+-- utility functions
+
+-- normalizes a vector but returns a fallback if it's too small
+-- prevents errors when trying to normalize zero-length vectors
+local function safeNormalize(vector, fallback)
+    local magnitude = vector.Magnitude
+    return magnitude > minVectorMagnitude and vector / magnitude or fallback
+end
+
+-- removes the y component to get horizontal direction only
+-- useful for camera-relative movement and character rotation
+local function flattenToHorizontal(vector)
+    return Vector3.new(vector.X, 0, vector.Z)
+end
+
+-- limits a vector's length without changing direction
+-- more efficient than normalizing then multiplying
+local function clampMagnitude(vector, maxMagnitude)
+    local magnitude = vector.Magnitude
+    return magnitude > maxMagnitude and vector / magnitude * maxMagnitude or vector
+end
+
+-- main grapple hook class
 local GrappleHook = {}
 GrappleHook.__index = GrappleHook
 
--- using OOP because each player needs independent grapple state, makes respawns cleaner
-function GrappleHook.new(char)
-	local hook = setmetatable({}, GrappleHook)
-	
-	hook.character = char
-	hook.humanoid = char:WaitForChild("Humanoid")
-	hook.hrp = char:WaitForChild("HumanoidRootPart")
-	hook.isGrappling = false
-	hook.grapplePoint = nil
-	
-	-- smooth interpolation toward desired length instead of instant changes
-	hook.currentRopeLength = 0
-	hook.desiredRopeLength = 0
-	
-	-- tracking velocity manually because we need to apply custom forces
-	hook.vel = Vector3.new()
-	
-	-- modern constraint objects, replacing deprecated BodyVelocity/BodyGyro
-	hook.linearVel = nil
-	hook.alignOrientation = nil
-	hook.attachment = nil
-	
-	hook.ropePart = nil
-	hook.targetIndicator = nil
-	hook.targetPos = nil
-	
-	-- manual input tracking because Humanoid.MoveDirection doesn't work in PlatformStand
-	hook.keysDown = {w = false, a = false, s = false, d = false}
-	hook.isReeling = false
-	hook.connections = {}
-	
-	hook:makeIndicator()
-	hook:bindInputs()
-	
-	return hook
+function GrappleHook.new(character)
+    local self = setmetatable({}, GrappleHook)
+    
+    self.character = character
+    self.humanoid = character:WaitForChild("Humanoid")
+    self.rootPart = character:WaitForChild("HumanoidRootPart")
+    
+    -- state tracking
+    self.isActive = false
+    self.anchorPoint = nil
+    self.ropeLength = 0
+    self.desiredLength = 0  -- what the rope length is lerping towards
+    self.velocity = vectorZero  -- we manually handle physics instead of using roblox's
+    self.keys = {w = false, a = false, s = false, d = false}
+    self.isReeling = false
+    self.connections = {}
+    
+    -- cache expensive references so we don't keep calling getservice
+    self.player = Players.LocalPlayer
+    self.mouse = self.player:GetMouse()
+    self.raycastParams = self:createRaycastParams()
+    
+    self:createIndicator()
+    self:bindInput()
+    self:startUpdateLoop()
+    
+    return self
 end
 
--- visual indicator so players can see where they're aiming before shooting
-function GrappleHook:makeIndicator()
-	local ind = Instance.new("Part")
-	ind.Name = "TargetIndicator"
-	ind.Size = Vector3.new(INDICATOR_SIZE, INDICATOR_SIZE, INDICATOR_SIZE)
-	ind.Shape = Enum.PartType.Ball
-	ind.Material = Enum.Material.Neon
-	ind.Color = INDICATOR_COL
-	ind.Transparency = 0.4
-	ind.Anchored = true
-	ind.CanCollide = false
-	ind.Parent = workspace
-	self.targetIndicator = ind
+function GrappleHook:createRaycastParams()
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    return params
 end
 
--- raycasts from camera through mouse to find valid grapple points
+-- creates the green ball that shows where you're aiming
+function GrappleHook:createIndicator()
+    local indicator = Instance.new("Part")
+    indicator.Name = "GrappleTarget"
+    indicator.Size = vectorOne * indicatorSize
+    indicator.Shape = Enum.PartType.Ball
+    indicator.Material = Enum.Material.Neon
+    indicator.Color = indicatorColor
+    indicator.Transparency = 1  -- starts hidden
+    indicator.Anchored = true
+    indicator.CanCollide = false
+    indicator.Parent = workspace
+    
+    self.indicator = indicator
+end
+
+-- raycasts from camera to mouse position to find valid grapple points
+function GrappleHook:findTarget()
+    local camera = workspace.CurrentCamera
+    local screenRay = camera:ScreenPointToRay(self.mouse.X, self.mouse.Y)
+    
+    -- update filter list without recreating params (optimization)
+    self.raycastParams.FilterDescendantsInstances = {self.character, self.indicator}
+    
+    local result = workspace:Raycast(
+        screenRay.Origin,
+        screenRay.Direction * maxDistance,
+        self.raycastParams
+    )
+    
+    if not result then return nil end
+    
+    -- validate distance constraints
+    local distance = (result.Position - self.rootPart.Position).Magnitude
+    if distance < minDistance or distance > maxDistance then
+        return nil
+    end
+    
+    return result.Position
+end
+
+-- shows the indicator when aiming at valid surfaces
 function GrappleHook:updateIndicator()
-	if self.isGrappling then
-		self.targetIndicator.Transparency = 1
-		return
-	end
-	
-	local mouse = Players.LocalPlayer:GetMouse()
-	local camera = workspace.CurrentCamera
-	local screenRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
-	local rayOrigin = screenRay.Origin
-	local rayDir = screenRay.Direction * MAX_GRAPPLE_DIST
-	
-	local params = RaycastParams.new()
-	params.FilterDescendantsInstances = {self.character, self.targetIndicator}
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	
-	local hit = workspace:Raycast(rayOrigin, rayDir, params)
-	
-	if hit then
-		local distance = (hit.Position - self.hrp.Position).Magnitude
-		
-		if distance >= MIN_DIST and distance <= MAX_GRAPPLE_DIST then
-			self.targetPos = hit.Position
-			self.targetIndicator.Position = hit.Position
-			self.targetIndicator.Transparency = 0.3
-			
-			-- pulsing effect makes target more visible
-			local pulseAmount = 0.85 + math.sin(tick() * 8) * 0.15
-			self.targetIndicator.Size = Vector3.new(INDICATOR_SIZE, INDICATOR_SIZE, INDICATOR_SIZE) * pulseAmount
-		else
-			self.targetIndicator.Transparency = 1
-			self.targetPos = nil
-		end
-	else
-		self.targetIndicator.Transparency = 1
-		self.targetPos = nil
-	end
+    local target = self:findTarget()
+    
+    if target then
+        self.indicator.Position = target
+        self.indicator.Transparency = 0.3
+        
+        -- pulsing animation makes it easier to see
+        local pulse = 0.85 + math.sin(tick() * pulseSpeed) * 0.15
+        self.indicator.Size = vectorOne * (indicatorSize * pulse)
+    else
+        self.indicator.Transparency = 1
+    end
 end
 
--- tracks input states manually for reliable simultaneous key detection
-function GrappleHook:bindInputs()
-	local conn1 = UIS.InputBegan:Connect(function(input, gpe)
-		if gpe then return end
-		
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			-- toggle grapple on click
-			if self.isGrappling then
-				self:detachGrapple()
-			else
-				self:fireGrapple()
-			end
-		elseif input.KeyCode == Enum.KeyCode.W then
-			self.keysDown.w = true
-		elseif input.KeyCode == Enum.KeyCode.A then
-			self.keysDown.a = true
-		elseif input.KeyCode == Enum.KeyCode.S then
-			self.keysDown.s = true
-		elseif input.KeyCode == Enum.KeyCode.D then
-			self.keysDown.d = true
-		elseif input.KeyCode == Enum.KeyCode.Space and self.isGrappling then
-			self.isReeling = true
-		end
-	end)
-	
-	local conn2 = UIS.InputEnded:Connect(function(input)
-		if input.KeyCode == Enum.KeyCode.W then
-			self.keysDown.w = false
-		elseif input.KeyCode == Enum.KeyCode.A then
-			self.keysDown.a = false
-		elseif input.KeyCode == Enum.KeyCode.S then
-			self.keysDown.s = false
-		elseif input.KeyCode == Enum.KeyCode.D then
-			self.keysDown.d = false
-		elseif input.KeyCode == Enum.KeyCode.Space then
-			self.isReeling = false
-		end
-	end)
-	
-	table.insert(self.connections, conn1)
-	table.insert(self.connections, conn2)
+-- sets up all input handling
+function GrappleHook:bindInput()
+    local conn1 = UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            -- left click toggles grapple
+            if self.isActive then
+                self:detach()
+            else
+                self:attach()
+            end
+        elseif input.KeyCode == Enum.KeyCode.Space then
+            self.isReeling = self.isActive
+        else
+            -- track wasd state for movement
+            local keyName = input.KeyCode.Name:lower()
+            if self.keys[keyName] ~= nil then
+                self.keys[keyName] = true
+            end
+        end
+    end)
+    
+    local conn2 = UserInputService.InputEnded:Connect(function(input)
+        if input.KeyCode == Enum.KeyCode.Space then
+            self.isReeling = false
+        else
+            local keyName = input.KeyCode.Name:lower()
+            if self.keys[keyName] ~= nil then
+                self.keys[keyName] = false
+            end
+        end
+    end)
+    
+    table.insert(self.connections, conn1)
+    table.insert(self.connections, conn2)
 end
 
--- initiates grapple and transitions to custom physics mode
-function GrappleHook:fireGrapple()
-	if self.isGrappling or not self.targetPos then return end
-	
-	local dist = (self.targetPos - self.hrp.Position).Magnitude
-	if dist < MIN_DIST or dist > MAX_GRAPPLE_DIST then return end
-	
-	self.isGrappling = true
-	self.grapplePoint = self.targetPos
-	self.currentRopeLength = dist
-	self.desiredRopeLength = dist
-	
-	-- preserve current velocity with slight boost instead of killing momentum
-	self.vel = self.hrp.AssemblyLinearVelocity * BOOST_ON_ATTACH
-	
-	self:startPhysics()
-	self:makeRope()
+-- starts the grapple when you click on a valid surface
+function GrappleHook:attach()
+    if self.isActive then return end
+    
+    local target = self:findTarget()
+    if not target then return end
+    
+    local distance = (target - self.rootPart.Position).Magnitude
+    
+    self.isActive = true
+    self.anchorPoint = target
+    self.ropeLength = distance
+    self.desiredLength = distance
+    self.velocity = self.rootPart.AssemblyLinearVelocity * velocityBoost  -- preserve momentum
+    
+    self:enablePhysics()
+    self:createRope()
+    self.indicator.Transparency = 1
 end
 
--- releases grapple and returns control to humanoid
-function GrappleHook:detachGrapple()
-	if not self.isGrappling then return end
-	
-	self.isGrappling = false
-	self.grapplePoint = nil
-	self.isReeling = false
-	
-	self:stopPhysics()
-	self:destroyRope()
+-- releases the grapple and returns control to normal humanoid
+function GrappleHook:detach()
+    if not self.isActive then return end
+    
+    -- apply our custom velocity back to the character
+    self.rootPart.AssemblyLinearVelocity = self.velocity
+    
+    self:disablePhysics()
+    self:destroyRope()
+    
+    self.isActive = false
+    self.anchorPoint = nil
+    self.isReeling = false
 end
 
--- enables custom physics using modern constraints, overrides humanoid movement
-function GrappleHook:startPhysics()
-	self.attachment = Instance.new("Attachment")
-	self.attachment.Parent = self.hrp
-	
-	-- LinearVelocity replaces deprecated BodyVelocity
-	self.linearVel = Instance.new("LinearVelocity")
-	self.linearVel.Attachment0 = self.attachment
-	self.linearVel.MaxForce = math.huge
-	self.linearVel.VectorVelocity = self.vel
-	self.linearVel.RelativeTo = Enum.ActuatorRelativeTo.World
-	self.linearVel.Parent = self.hrp
-	
-	-- keeps character upright during swings instead of tumbling
-	self.alignOrientation = Instance.new("AlignOrientation")
-	self.alignOrientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
-	self.alignOrientation.Attachment0 = self.attachment
-	self.alignOrientation.MaxTorque = 9e5
-	self.alignOrientation.Responsiveness = 50
-	self.alignOrientation.CFrame = self.hrp.CFrame
-	self.alignOrientation.RigidityEnabled = false
-	self.alignOrientation.Parent = self.hrp
-	
-	-- disables humanoid physics so it doesn't fight our custom forces
-	self.humanoid:ChangeState(Enum.HumanoidStateType.Physics)
-	self.humanoid.PlatformStand = true
+-- switches to manual physics mode so we can handle everything ourselves
+function GrappleHook:enablePhysics()
+    local attachment = Instance.new("Attachment", self.rootPart)
+    
+    -- linearvelocity lets us directly control the character's velocity
+    local linearVel = Instance.new("LinearVelocity")
+    linearVel.Attachment0 = attachment
+    linearVel.MaxForce = math.huge
+    linearVel.VectorVelocity = self.velocity
+    linearVel.RelativeTo = Enum.ActuatorRelativeTo.World
+    linearVel.Parent = self.rootPart
+    
+    -- alignorientation keeps the character upright and facing movement direction
+    local alignOrient = Instance.new("AlignOrientation")
+    alignOrient.Mode = Enum.OrientationAlignmentMode.OneAttachment
+    alignOrient.Attachment0 = attachment
+    alignOrient.MaxTorque = 9e5
+    alignOrient.Responsiveness = 50
+    alignOrient.CFrame = self.rootPart.CFrame
+    alignOrient.RigidityEnabled = false
+    alignOrient.Parent = self.rootPart
+    
+    self.attachment = attachment
+    self.linearVel = linearVel
+    self.alignOrient = alignOrient
+    
+    -- physics state disables normal humanoid movement
+    self.humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+    self.humanoid.PlatformStand = true
 end
 
--- restores normal physics and preserves velocity for momentum chaining
-function GrappleHook:stopPhysics()
-	if self.linearVel then
-		self.hrp.AssemblyLinearVelocity = self.vel
-		self.linearVel:Destroy()
-		self.linearVel = nil
-	end
-	
-	if self.alignOrientation then
-		self.alignOrientation:Destroy()
-		self.alignOrientation = nil
-	end
-	
-	if self.attachment then
-		self.attachment:Destroy()
-		self.attachment = nil
-	end
-	
-	self.humanoid.PlatformStand = false
-	self.humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+-- cleans up physics constraints and returns to normal movement
+function GrappleHook:disablePhysics()
+    self.linearVel:Destroy()
+    self.alignOrient:Destroy()
+    self.attachment:Destroy()
+    
+    self.linearVel = nil
+    self.alignOrient = nil
+    self.attachment = nil
+    
+    self.humanoid.PlatformStand = false
+    self.humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
 end
 
--- converts WASD to camera-relative direction, flattened to horizontal plane
-function GrappleHook:getInputDirection()
-	local cam = workspace.CurrentCamera
-	local camForward = cam.CFrame.LookVector
-	local camRight = cam.CFrame.RightVector
-	
-	local flatForward = Vector3.new(camForward.X, 0, camForward.Z)
-	local flatRight = Vector3.new(camRight.X, 0, camRight.Z)
-	
-	-- safe normalization - if looking straight up/down, use fallback direction to prevent errors
-	if flatForward.Magnitude < 0.01 then
-		flatForward = Vector3.new(0, 0, -1)
-	else
-		flatForward = flatForward.Unit
-	end
-	
-	if flatRight.Magnitude < 0.01 then
-		flatRight = Vector3.new(1, 0, 0)
-	else
-		flatRight = flatRight.Unit
-	end
-	
-	local moveVec = Vector3.new()
-	if self.keysDown.w then moveVec = moveVec + flatForward end
-	if self.keysDown.s then moveVec = moveVec - flatForward end
-	if self.keysDown.a then moveVec = moveVec - flatRight end
-	if self.keysDown.d then moveVec = moveVec + flatRight end
-	
-	if moveVec.Magnitude > 0 then
-		return moveVec.Unit
-	end
-	return Vector3.new()
+-- converts wasd input to world-space movement relative to camera
+function GrappleHook:getCameraRelativeInput()
+    local camera = workspace.CurrentCamera
+    
+    -- get camera directions but only on horizontal plane
+    local forward = flattenToHorizontal(camera.CFrame.LookVector)
+    local right = flattenToHorizontal(camera.CFrame.RightVector)
+    
+    -- normalize with fallback in case camera is looking straight up/down
+    forward = safeNormalize(forward, fallbackForward)
+    right = safeNormalize(right, fallbackRight)
+    
+    -- combine input into a single direction
+    local direction = vectorZero
+    if self.keys.w then direction += forward end
+    if self.keys.s then direction -= forward end
+    if self.keys.a then direction -= right end
+    if self.keys.d then direction += right end
+    
+    return safeNormalize(direction, vectorZero)
 end
 
--- main physics loop. doing custom physics instead of RopeConstraint because I need precise control over feel
-function GrappleHook:physicsStep(dt)
-	if not self.isGrappling or not self.grapplePoint then return end
-	
-	local pos = self.hrp.Position
-	local toGrapple = self.grapplePoint - pos
-	local ropeDir = toGrapple.Unit
-	local dist = toGrapple.Magnitude
-	
-	-- reeling mechanic
-	if self.isReeling then
-		self.desiredRopeLength = math.max(self.desiredRopeLength - REEL_SPEED, 3)
-	end
-	
-	-- smooth interpolation toward desired length instead of instant change
-	self.currentRopeLength = self.currentRopeLength + (self.desiredRopeLength - self.currentRopeLength) * 0.15
-	
-	-- gravity
-	self.vel = self.vel + Vector3.new(0, -GRAVITY, 0) * dt
-	
-	-- rope constraint using spring physics
-	if dist > self.currentRopeLength then
-		local stretch = dist - self.currentRopeLength
-		
-		-- hooke's law (F = kx)
-		local springForce = ropeDir * stretch * ROPE_SPRING
-		self.vel = self.vel + springForce * dt
-		
-		-- cancel velocity moving away from anchor to prevent infinite stretching
-		local velocityToward = self.vel:Dot(ropeDir)
-		if velocityToward < 0 then
-			self.vel = self.vel - ropeDir * velocityToward * 1.2
-		end
-		
-		-- centripetal acceleration for circular motion (v²/r)
-		local perpVel = self.vel - (self.vel:Dot(ropeDir) * ropeDir)
-		local centripetal = perpVel.Magnitude * perpVel.Magnitude / self.currentRopeLength
-		self.vel = self.vel + ropeDir * centripetal * dt
-	end
-	
-	-- player control - WASD applies force mid-swing
-	local inputDir = self:getInputDirection()
-	if inputDir.Magnitude > 0 then
-		local radial = self.vel:Dot(ropeDir) * ropeDir
-		local tangent = self.vel - radial
-		local controlForce = inputDir * PLAYER_CONTROL
-		
-		-- boost control when moving with the swing instead of against it
-		if tangent.Magnitude > 5 then
-			local swingDir = tangent.Unit
-			local matchAmount = math.abs(inputDir:Dot(swingDir))
-			controlForce = controlForce * (1 + matchAmount * SWING_MULTIPLIER)
-		end
-		
-		self.vel = self.vel + controlForce * dt
-	end
-	
-	-- quadratic air drag
-	local speed = self.vel.Magnitude
-	if speed > 0 then
-		local dragAmount = speed * speed * 0.0003
-		self.vel = self.vel - self.vel.Unit * dragAmount * dt
-	end
-	
-	self.vel = self.vel * AIR_RESISTANCE
-	
-	-- velocity cap to prevent physics instability
-	if self.vel.Magnitude > MAX_VELOCITY then
-		self.vel = self.vel.Unit * MAX_VELOCITY
-	end
-	
-	self.linearVel.VectorVelocity = self.vel
-	
-	-- face movement direction
-	local flatVel = Vector3.new(self.vel.X, 0, self.vel.Z)
-	if flatVel.Magnitude > 2 then
-		self.alignOrientation.CFrame = CFrame.lookAt(pos, pos + flatVel)
-	end
+-- handles space bar reeling and smooth length transitions
+function GrappleHook:updateRopeLength()
+    if self.isReeling then
+        self.desiredLength = math.max(self.desiredLength - reelSpeed, minRopeLength)
+    end
+    
+    -- lerp actual length towards desired for smoothness
+    self.ropeLength += (self.desiredLength - self.ropeLength) * ropeLengthLerp
 end
 
--- creates rope visual
-function GrappleHook:makeRope()
-	local rope = Instance.new("Part")
-	rope.Name = "Rope"
-	rope.Material = Enum.Material.Neon
-	rope.Color = ROPE_COL
-	rope.Anchored = true
-	rope.CanCollide = false
-	rope.CastShadow = false
-	rope.Parent = workspace
-	self.ropePart = rope
+-- applies downward acceleration every frame
+function GrappleHook:applyGravity(dt)
+    self.velocity += gravityVector * dt
 end
 
--- stretches rope part between player and anchor point. using Part instead of Beam for performance
+-- this is the core rope physics - keeps you at rope distance from anchor
+function GrappleHook:applyRopeConstraint(ropeDir, distance, dt)
+    if distance <= self.ropeLength then return end
+    
+    -- rope is stretched, apply spring force to pull back
+    local stretch = distance - self.ropeLength
+    self.velocity += ropeDir * stretch * ropeSpring * dt
+    
+    -- damp velocity along the rope to reduce bouncing
+    local radialVel = self.velocity:Dot(ropeDir)
+    if radialVel < 0 then
+        self.velocity -= ropeDir * radialVel * ropeStretchDamping
+    end
+    
+    -- centripetal acceleration for circular motion around anchor point
+    -- this is what makes swinging feel smooth and natural
+    local tangentVel = self.velocity - (radialVel * ropeDir)
+    local tangentSpeed = tangentVel.Magnitude
+    if tangentSpeed > minVectorMagnitude then
+        local centripetalAccel = tangentSpeed * tangentSpeed / self.ropeLength
+        self.velocity += ropeDir * centripetalAccel * dt
+    end
+end
+
+-- wasd control while swinging, with momentum-based bonus
+function GrappleHook:applyPlayerControl(ropeDir, moveDir, dt)
+    if moveDir == vectorZero then return end
+    
+    -- get velocity perpendicular to rope (tangent to swing arc)
+    local tangent = self.velocity - (self.velocity:Dot(ropeDir) * ropeDir)
+    local force = moveDir * controlForce
+    
+    -- reward moving with swing momentum instead of against it
+    -- this encourages skillful directional control
+    local tangentSpeed = tangent.Magnitude
+    if tangentSpeed > swingThreshold then
+        local alignment = math.abs(moveDir:Dot(tangent / tangentSpeed))
+        force *= (1 + alignment * swingBonus)
+    end
+    
+    self.velocity += force * dt
+end
+
+-- air resistance increases with speed squared (realistic drag model)
+function GrappleHook:applyAirResistance(dt)
+    local speed = self.velocity.Magnitude
+    if speed <= minVectorMagnitude then return end
+    
+    -- quadratic drag (more realistic than linear)
+    self.velocity -= self.velocity / speed * (speed * speed * quadraticDrag) * dt
+    
+    -- linear drag for consistent slowdown
+    self.velocity *= airDrag
+end
+
+-- rotates character to face movement direction (looks better)
+function GrappleHook:updateCharacterOrientation()
+    local pos = self.rootPart.Position
+    local flatVel = flattenToHorizontal(self.velocity)
+    
+    -- only rotate if moving fast enough to avoid jittering
+    if flatVel.Magnitude > minRotateSpeed then
+        self.alignOrient.CFrame = CFrame.lookAt(pos, pos + flatVel)
+    end
+end
+
+-- main physics loop - runs every frame while grappling
+function GrappleHook:simulate(dt)
+    local pos = self.rootPart.Position
+    local toAnchor = self.anchorPoint - pos
+    local distance = toAnchor.Magnitude
+    
+    -- prevent division by zero if somehow at exact anchor point
+    if distance < minVectorMagnitude then return end
+    
+    local ropeDir = toAnchor / distance
+    
+    -- apply all forces in order
+    self:updateRopeLength()
+    self:applyGravity(dt)
+    self:applyRopeConstraint(ropeDir, distance, dt)
+    
+    local moveDir = self:getCameraRelativeInput()
+    self:applyPlayerControl(ropeDir, moveDir, dt)
+    
+    self:applyAirResistance(dt)
+    
+    -- enforce speed limit to prevent physics breaking
+    self.velocity = clampMagnitude(self.velocity, maxSpeed)
+    
+    -- write our calculated velocity back to the constraint
+    self.linearVel.VectorVelocity = self.velocity
+    
+    self:updateCharacterOrientation()
+end
+
+-- creates the visible rope part
+function GrappleHook:createRope()
+    local rope = Instance.new("Part")
+    rope.Name = "GrappleRope"
+    rope.Material = Enum.Material.Neon
+    rope.Color = ropeColor
+    rope.Anchored = true
+    rope.CanCollide = false
+    rope.CastShadow = false
+    rope.Parent = workspace
+    
+    self.rope = rope
+end
+
+-- updates rope position and size to stretch between character and anchor
 function GrappleHook:updateRope()
-	if not self.isGrappling or not self.ropePart or not self.grapplePoint then return end
-	
-	local startPt = self.hrp.Position + Vector3.new(0, 2, 0)
-	local endPt = self.grapplePoint
-	local length = (endPt - startPt).Magnitude
-	local ropeCF = CFrame.lookAt(startPt, endPt)
-	self.ropePart.CFrame = ropeCF * CFrame.new(0, 0, -length / 2)
-	self.ropePart.Size = Vector3.new(ROPE_THICKNESS, ROPE_THICKNESS, length)
+    local startPos = self.rootPart.Position + ropeOffset
+    local endPos = self.anchorPoint
+    local length = (endPos - startPos).Magnitude
+    
+    -- position at midpoint, oriented towards anchor, stretched to length
+    self.rope.CFrame = CFrame.lookAt((startPos + endPos) * 0.5, endPos)
+    self.rope.Size = Vector3.new(ropeThickness, ropeThickness, length)
 end
 
--- cleans up rope visual
 function GrappleHook:destroyRope()
-	if self.ropePart then
-		self.ropePart:Destroy()
-		self.ropePart = nil
-	end
+    if self.rope then
+        self.rope:Destroy()
+        self.rope = nil
+    end
 end
 
--- routes updates to physics or indicator depending on state
-function GrappleHook:tick(dt)
-	if self.isGrappling then
-		self:physicsStep(dt)
-		self:updateRope()
-	else
-		self:updateIndicator()
-	end
+-- main update loop that runs every frame
+function GrappleHook:startUpdateLoop()
+    local conn = RunService.Heartbeat:Connect(function(dt)
+        if self.isActive then
+            self:simulate(dt)
+            self:updateRope()
+        else
+            self:updateIndicator()
+        end
+    end)
+    
+    table.insert(self.connections, conn)
 end
 
--- connects heartbeat loop
-function GrappleHook:init()
-	local tickConn = RunService.Heartbeat:Connect(function(dt)
-		self:tick(dt)
-	end)
-	table.insert(self.connections, tickConn)
-end
-
--- cleanup to prevent memory leaks on respawn
+-- cleanup when character dies or script stops
 function GrappleHook:destroy()
-	for _, conn in ipairs(self.connections) do
-		conn:Disconnect()
-	end
-	
-	if self.isGrappling then
-		self:detachGrapple()
-	end
-	
-	if self.targetIndicator then
-		self.targetIndicator:Destroy()
-	end
-	
-	setmetatable(self, nil)
+    for _, conn in ipairs(self.connections) do
+        conn:Disconnect()
+    end
+    
+    if self.isActive then
+        self:detach()
+    end
+    
+    if self.indicator then
+        self.indicator:Destroy()
+    end
 end
 
-local plr = Players.LocalPlayer
-local char = plr.Character or plr.CharacterAdded:Wait()
-local hum = char:WaitForChild("Humanoid")
-
+-- initialization
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
 task.wait(0.2)
 
-local hook = GrappleHook.new(char)
-hook:init()
+local currentHook = GrappleHook.new(character)
 
-hum.Died:Connect(function()
-	hook:destroy()
-end)
-
-plr.CharacterAdded:Connect(function(newChar)
-	task.wait(0.2)
-	char = newChar
-	hum = newChar:WaitForChild("Humanoid")
-	hook = GrappleHook.new(newChar)
-	hook:init()
+-- recreate hook when character respawns
+player.CharacterAdded:Connect(function(newChar)
+    if currentHook then
+        currentHook:destroy()
+    end
+    task.wait(0.2)
+    currentHook = GrappleHook.new(newChar)
 end)
 
 return GrappleHook
