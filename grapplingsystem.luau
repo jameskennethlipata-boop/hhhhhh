@@ -317,7 +317,7 @@ function GrappleHook:applyGravity(dt)
 	self.velocity += gravityVector * dt
 end
 
--- this is the core rope physics - keeps you at rope distance from anchor
+-- this is the core rope physics, keeps you at rope distance from anchor
 function GrappleHook:applyRopeConstraint(ropeDir, distance, dt)
 	if distance <= self.ropeLength then return end
 
